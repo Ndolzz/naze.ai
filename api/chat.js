@@ -17,7 +17,7 @@
 
 export const config = { runtime: 'edge' };
 
-const MODEL = 'gemini-2.5-flash'; // free-tier, multimodal (text + vision)
+const MODEL = 'gemini-3.6-flash'; // free-tier, multimodal (text + vision)
 const MAX_TOKENS_CAP = 4096;
 
 function toGeminiContents(messages) {
