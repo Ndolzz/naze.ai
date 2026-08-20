@@ -119,40 +119,68 @@ export default async function handler(req) {
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`;
 
-  // Try each key in turn. A key that's out of quota (429) or rejected (403)
-  // just moves on to the next one instead of failing the whole request —
-  // that's the point of having 10 free keys instead of 1.
-  let upstream = null;
-  let lastErrStatus = 500;
-  let lastErrDetail = '';
-  for (const apiKey of apiKeys) {
+  // Try each key in turn for a given payload. A key that's out of quota (429)
+  // or rejected (403) just moves on to the next one instead of failing the
+  // whole request right away — that's the point of having several free keys.
+  async function attemptWithKeys(reqPayload) {
+    let upstream = null, lastErrStatus = 500, lastErrDetail = '';
+    for (const apiKey of apiKeys) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+          body: JSON.stringify(reqPayload),
+          // If the client hits "Stop" (or the tab closes), req.signal aborts —
+          // propagate that to the Gemini call too, so we stop burning free-tier
+          // quota on a response nobody is reading anymore.
+          signal: req.signal
+        });
+        if (res.ok && res.body) { upstream = res; break; }
+        lastErrStatus = res.status;
+        lastErrDetail = await res.text().catch(() => '');
+        // 429 = quota habis untuk key ini, 403 = key ditolak/invalid — lanjut ke key berikutnya.
+        if (res.status !== 429 && res.status !== 403) break;
+      } catch (e) {
+        if (e.name === 'AbortError') { throw e; }
+        lastErrStatus = 502;
+        lastErrDetail = String(e.message || e).slice(0, 300);
+        // Network-level error on this key — try the next one too.
+      }
+    }
+    return { upstream, lastErrStatus, lastErrDetail };
+  }
+
+  let result;
+  try {
+    result = await attemptWithKeys(payload);
+  } catch (e) {
+    return new Response(null, { status: 499 });
+  }
+
+  // Fallback: if a request WITH the google_search tool fails outright (not a
+  // quota issue), some free-tier / no-billing projects reject the grounding
+  // tool itself even though plain chat works fine on the same key. Rather
+  // than let Auto Browse break every single message (even ones that don't
+  // need browsing), retry once without the tool so the chat still works —
+  // just without browsing for that turn.
+  let browsingFellBack = false;
+  if (!result.upstream && payload.tools && result.lastErrStatus !== 429) {
+    const fallbackPayload = { ...payload };
+    delete fallbackPayload.tools;
     try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-        body: JSON.stringify(payload),
-        // If the client hits "Stop" (or the tab closes), req.signal aborts —
-        // propagate that to the Gemini call too, so we stop burning free-tier
-        // quota on a response nobody is reading anymore.
-        signal: req.signal
-      });
-      if (res.ok && res.body) {
-        upstream = res;
-        break;
+      const retryResult = await attemptWithKeys(fallbackPayload);
+      if (retryResult.upstream) {
+        result = retryResult;
+        browsingFellBack = true;
+      } else {
+        // keep the original (grounded) error — it's more informative than the fallback's
       }
-      lastErrStatus = res.status;
-      lastErrDetail = await res.text().catch(() => '');
-      // 429 = quota habis untuk key ini, 403 = key ditolak/invalid — lanjut ke key berikutnya.
-      if (res.status !== 429 && res.status !== 403) break;
     } catch (e) {
-      if (e.name === 'AbortError') {
-        return new Response(null, { status: 499 });
-      }
-      lastErrStatus = 502;
-      lastErrDetail = String(e.message || e).slice(0, 300);
-      // Network-level error on this key — try the next one too.
+      return new Response(null, { status: 499 });
     }
   }
+
+  const { upstream, lastErrStatus, lastErrDetail } = result;
 
   if (!upstream) {
     const isQuota = lastErrStatus === 429;
